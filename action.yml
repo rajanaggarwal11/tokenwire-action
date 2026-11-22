@@ -44,17 +44,30 @@ inputs:
     required: false
     default: ""
   comment:
-    description: "On pull requests, post the report as a comment and keep updating that one comment. Needs `pull-requests: write`."
+    description: >-
+      On pull requests, post the report as a comment and keep updating that one comment.
+      Needs `pull-requests: write`. Set false when the scenario runs untrusted code and post
+      the `markdown` output from a separate job instead (see the README).
     required: false
     default: "true"
+  comment-author:
+    description: >-
+      Login the comment is posted as, e.g. `my-app[bot]` for a GitHub App token. Only a
+      comment by this login is updated. Empty: the token's user if it can be read, otherwise
+      any bot.
+    required: false
+    default: ""
   github-token:
-    description: "Token for the PR comment."
+    description: "Token for the PR comment and for fetching the base branch."
     required: false
     default: ${{ github.token }}
   version:
-    description: "Version of tokenwire to run: an npm dist-tag or version, or the path of a packed tarball."
+    description: >-
+      Version of tokenwire to run. Defaults to the exact version this release of the action
+      was tested with, so `@v1` always runs a known build. Set an exact version (`0.2.1`),
+      an npm dist-tag (`latest`), or the path of a packed tarball to override.
     required: false
-    default: "latest"
+    default: "0.2.0"
   working-directory:
     description: "Directory to run in."
     required: false
@@ -82,10 +95,72 @@ outputs:
   report:
     description: "Path to the JSON report on the runner."
     value: ${{ steps.run.outputs.report }}
+  markdown:
+    description: "Path to the Markdown report on the runner: the PR comment's body. Empty when no diff was made."
+    value: ${{ steps.run.outputs.markdown }}
 
 runs:
   using: composite
   steps:
+    # 1. On a pull request with no baseline: was there one on the base branch? If so the PR
+    #    deleted it, and writing a fresh one would make any change pass. This runs before
+    #    anything from the PR does, and is the only step besides the comment that gets the
+    #    token (for the fetch, through git's environment, never argv).
+    - id: guard
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TW_SNAPSHOT: ${{ inputs.snapshot }}
+        TW_BASE: ${{ github.base_ref || github.event.merge_group.base_ref }}
+        TW_TOKEN: ${{ inputs.github-token }}
+      run: |
+        TW_BASE="${TW_BASE#refs/heads/}"
+        # Only a regular file counts as a baseline. A symlink or a directory is treated as
+        # missing, the same way the run step treats it.
+        if [ -f "$TW_SNAPSHOT" ] && [ ! -L "$TW_SNAPSHOT" ]; then
+          exit 0
+        fi
+        if ! top=$(git rev-parse --show-toplevel 2>/dev/null); then
+          echo "::error::tokenwire: $TW_SNAPSHOT is missing and this is not a git checkout, so the action cannot tell whether $TW_BASE has a baseline. Run actions/checkout before this action."
+          exit 2
+        fi
+        case "$TW_SNAPSHOT" in
+          "$top"/*) spec="${TW_SNAPSHOT#"$top"/}" ;;
+          /*) exit 0 ;; # outside the repository, so it cannot be committed on the base branch either
+          *) spec="./$TW_SNAPSHOT" ;; # git resolves ./ against the current directory
+        esac
+
+        if [ -n "$TW_TOKEN" ]; then
+          basic=$(printf 'x-access-token:%s' "$TW_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$basic"
+          # An empty value first clears any header actions/checkout persisted.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" GIT_CONFIG_VALUE_0=""
+          export GIT_CONFIG_KEY_1="http.${GITHUB_SERVER_URL}/.extraheader" GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $basic"
+        fi
+        # --depth only on a shallow checkout (the actions/checkout default): on a full clone
+        # it would make the repository shallow.
+        depth=()
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          depth=(--depth=1)
+        fi
+        status=0
+        git -c core.hooksPath=/dev/null fetch --quiet --no-tags --no-recurse-submodules "${depth[@]}" \
+          origin "+refs/heads/$TW_BASE:refs/remotes/origin/$TW_BASE" || status=$?
+        if [ "$status" -ne 0 ]; then
+          echo "::error::tokenwire: $TW_SNAPSHOT is missing, and the base branch $TW_BASE could not be fetched to check whether it has one. Commit the baseline, or make origin fetchable from this job."
+          exit 2
+        fi
+        if git cat-file -e "refs/remotes/origin/$TW_BASE:$spec" 2>/dev/null; then
+          echo "::error file=$TW_SNAPSHOT::tokenwire: $TW_SNAPSHOT exists on $TW_BASE but is missing here (or is not a regular file). Without it every change would pass, so this fails. Restore it with 'git checkout origin/$TW_BASE -- $TW_SNAPSHOT', or regenerate it locally and commit it if the change is intended."
+          exit 1
+        fi
+
+    # 2. Record, compare, report. The token is not in this step's environment: it runs the
+    #    scenario, which is code from the pull request, and the tokenwire package from npm.
+    #    That keeps it out of their reach in the simple case only; code running in the
+    #    same job can still tamper with later steps (see the README, "Untrusted code").
     - id: run
       shell: bash
       working-directory: ${{ inputs.working-directory }}
@@ -98,12 +173,7 @@ runs:
         TW_RUNS: ${{ inputs.runs-per-day }}
         TW_OFFLINE: ${{ inputs.offline }}
         TW_REPLY: ${{ inputs.reply }}
-        TW_COMMENT: ${{ inputs.comment }}
         TW_VERSION: ${{ inputs.version }}
-        GH_TOKEN: ${{ inputs.github-token }}
-        TW_EVENT: ${{ github.event_name }}
-        TW_PR: ${{ github.event.pull_request.number }}
-        TW_REPO: ${{ github.repository }}
       run: |
         # A composite `shell: bash` step runs as `bash -e -o pipefail`. Every command
         # whose exit code matters captures it on the same line, which -e leaves alone.
@@ -112,6 +182,7 @@ runs:
           echo "::error::tokenwire: the 'run' input is empty."
           exit 2
         fi
+        # An exact package spec, so npx runs this package at this version and nothing else.
         case "$TW_VERSION" in
           *.tgz|file:*|/*|./*) pkg="${TW_VERSION#file:}" ;;
           *) pkg="tokenwire@${TW_VERSION}" ;;
@@ -123,23 +194,43 @@ runs:
         md="${RUNNER_TEMP}/tokenwire.diff.md"
         echo "report=$report" >> "$GITHUB_OUTPUT"
 
-        # 1. Record. --only budget with no budget runs no lint rules, so wrap's exit
-        #    code is the scenario's own: a failing scenario fails the step.
+        # Record. --only budget with no budget runs no lint rules, so wrap's exit code is
+        # the scenario's own: a failing scenario fails the step.
         wrap=(wrap --session "$session" --only budget)
         if [ "$TW_OFFLINE" = "true" ]; then
           wrap+=(--offline)
           [ -n "$TW_REPLY" ] && wrap+=(--reply "$TW_REPLY")
         fi
         echo "::group::tokenwire · recording: $TW_RUN"
+        # Where util-linux setsid is available (Linux runners), the scenario gets its own
+        # process group, and whatever it leaves running is killed before the next step.
+        # Best effort: a process can leave the group on purpose.
+        scenario=(bash -c "$TW_RUN")
+        pgfile="${RUNNER_TEMP}/tokenwire.scenario.pgid"
+        rm -f "$pgfile"
+        if setsid --help 2>/dev/null | grep -q -- '--wait'; then
+          # shellcheck disable=SC2016 # $$ and $0/$1 belong to the inner bash
+          scenario=(setsid --wait bash -c 'printf %s "$$" > "$1"; exec bash -c "$0"' "$TW_RUN" "$pgfile")
+        fi
         status=0
-        tw "${wrap[@]}" -- bash -c "$TW_RUN" || status=$?
+        tw "${wrap[@]}" -- "${scenario[@]}" || status=$?
+        if [ -s "$pgfile" ]; then
+          kill -KILL -- "-$(cat "$pgfile")" 2>/dev/null || true
+        fi
         echo "::endgroup::"
         if [ "$status" -ne 0 ]; then
           echo "::error::tokenwire: the scenario exited $status. See the log above."
           exit 2
         fi
 
-        # 2. No baseline yet: write it and stop here.
+        # Only a regular file is a baseline. Anything else at that path is an error rather
+        # than a reason to write a new one through it.
+        if [ -L "$TW_SNAPSHOT" ] || { [ -e "$TW_SNAPSHOT" ] && [ ! -f "$TW_SNAPSHOT" ]; }; then
+          echo "::error file=$TW_SNAPSHOT::tokenwire: $TW_SNAPSHOT is not a regular file (a symlink or a directory). Commit the baseline as a plain file."
+          exit 2
+        fi
+        # No baseline (and, on a pull request, none on the base branch either): write it
+        # and stop here.
         if [ ! -f "$TW_SNAPSHOT" ]; then
           status=0
           tw snapshot "$session" -o "$TW_SNAPSHOT" || status=$?
@@ -148,17 +239,17 @@ runs:
             exit 2
           fi
           echo "baseline-written=true" >> "$GITHUB_OUTPUT"
-          echo "::notice file=$TW_SNAPSHOT::tokenwire wrote the baseline $TW_SNAPSHOT. Commit it; later runs diff against it."
+          echo "::notice file=$TW_SNAPSHOT::tokenwire wrote the baseline $TW_SNAPSHOT on this runner. It is lost when the job ends: create it locally and commit it (see the README)."
           {
             echo "## tokenwire"
             echo
-            echo "No baseline yet, so this run wrote \`$TW_SNAPSHOT\`. Commit it: from the next run on, every change is compared against it."
+            echo "No baseline yet, so this run wrote \`$TW_SNAPSHOT\` on the runner, where it is thrown away. Create it locally and commit it: \`npx tokenwire wrap --offline -- <your command>\`, then \`npx tokenwire snapshot\`."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         echo "baseline-written=false" >> "$GITHUB_OUTPUT"
 
-        # 3. Diff.
+        # Diff.
         args=(diff "$TW_SNAPSHOT" "$session")
         [ -n "$TW_MAX" ] && args+=(--max-increase "$TW_MAX")
         [ -n "$TW_PRICE" ] && args+=(--price "$TW_PRICE")
@@ -173,32 +264,21 @@ runs:
         tw "${args[@]}" --format markdown > "$md" || true
         tw "${args[@]}" || true
         cat "$md" >> "$GITHUB_STEP_SUMMARY"
+        echo "markdown=$md" >> "$GITHUB_OUTPUT"
 
         node -e '
           const fs = require("fs");
           const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-          const pct = d.delta.pct === null ? "" : d.delta.pct.toFixed(1);
+          const pct = d.delta.pct === null ? "" : Number(d.delta.pct).toFixed(1);
           fs.appendFileSync(process.env.GITHUB_OUTPUT,
-            `input-tokens=${d.head.inputTokens}\nbase-input-tokens=${d.base.inputTokens}\n` +
-            `delta-tokens=${d.delta.tokens}\ndelta-pct=${pct}\ncache-break=${d.cache.introduced.length > 0}\n`);
+            `input-tokens=${Number(d.head.inputTokens)}\nbase-input-tokens=${Number(d.base.inputTokens)}\n` +
+            `delta-tokens=${Number(d.delta.tokens)}\ndelta-pct=${pct}\ncache-break=${d.cache.introduced.length > 0}\n`);
         ' "$report"
 
-        # 4. One comment per PR, updated in place.
-        if [ "$TW_COMMENT" = "true" ] && [ -n "$TW_PR" ]; then
-          marker="<!-- tokenwire-diff -->"
-          existing=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null | head -n1 || true)
-          if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/$TW_REPO/issues/comments/$existing" -F "body=@$md" >/dev/null \
-              || echo "::warning::tokenwire could not update the PR comment (does the job have pull-requests: write?)"
-          else
-            gh api -X POST "repos/$TW_REPO/issues/$TW_PR/comments" -F "body=@$md" >/dev/null \
-              || echo "::warning::tokenwire could not comment on the PR (does the job have pull-requests: write?)"
-          fi
-        fi
-
-        # 5. Verdict. The CLI fails on a new cache break and on --max-increase; a
-        #    cache break alone can be waved through with fail-on-cache-break: false.
+        # The CLI fails on a new cache break and on --max-increase; a cache break alone can
+        # be waved through with fail-on-cache-break: false. The verdict is applied after
+        # the comment, so a failing PR still gets its report.
+        failed=false
         if [ "$status" -eq 1 ]; then
           only_cache=$(node -e '
             const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
@@ -206,12 +286,58 @@ runs:
           ' "$report")
           if [ "$TW_CACHE" != "true" ] && [ "$only_cache" = "true" ]; then
             echo "::warning::tokenwire: this change breaks prompt caching (fail-on-cache-break is off)."
-            exit 0
+          else
+            failed=true
           fi
-          node -e '
-            const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-            for (const f of d.failures) console.log(`::error::tokenwire: ${f}`);
-          ' "$report"
-          exit 1
         fi
-        exit 0
+        echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+    # 3. One comment per PR, updated in place. Only a comment by the identity the action
+    #    posts as is ever edited, so a marker pasted into someone else's comment is ignored.
+    - id: comment
+      if: inputs.comment == 'true' && github.event.pull_request.number && steps.run.outputs.markdown != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TW_PR: ${{ github.event.pull_request.number }}
+        TW_REPO: ${{ github.repository }}
+        TW_MD: ${{ steps.run.outputs.markdown }}
+        TW_MARKER: "<!-- tokenwire-diff -->"
+        TW_AUTHOR: ${{ inputs.comment-author }}
+      run: |
+        # Who the comment is posted as: the comment-author input; else the token's user,
+        # which a personal access token can read; else (GITHUB_TOKEN, GitHub App tokens:
+        # GET /user is a 403) any bot. gh prints an error body to stdout, so only a zero
+        # exit counts.
+        if [ -z "$TW_AUTHOR" ]; then
+          if login=$(gh api user --jq .login 2>/dev/null) && [ -n "$login" ] && [ "$login" != "null" ]; then
+            TW_AUTHOR="$login"
+          fi
+        fi
+        export TW_AUTHOR
+        filter=$(cat "$GITHUB_ACTION_PATH/lib/find-comment.jq")
+        if ! ids=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate --jq "$filter" 2>/dev/null); then
+          echo "::warning::tokenwire could not list the PR's comments, so it did not post one (a new one could duplicate the existing). The report is in the job summary."
+          exit 0
+        fi
+        existing=$(printf '%s\n' "$ids" | head -n1)
+        case "$existing" in *[!0-9]*) existing="" ;; esac
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/$TW_REPO/issues/comments/$existing" -F "body=@$TW_MD" >/dev/null \
+            || echo "::warning::tokenwire could not update the PR comment (does the job have pull-requests: write?)"
+        else
+          gh api -X POST "repos/$TW_REPO/issues/$TW_PR/comments" -F "body=@$TW_MD" >/dev/null \
+            || echo "::warning::tokenwire could not comment on the PR. Pull requests from forks get a read-only token; the report is in the job summary."
+        fi
+
+    # 4. Verdict.
+    - if: steps.run.outputs.failed == 'true'
+      shell: bash
+      env:
+        TW_REPORT: ${{ steps.run.outputs.report }}
+      run: |
+        node -e '
+          const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+          for (const f of d.failures) console.log(`::error::tokenwire: ${String(f).replace(/[\r\n]+/g, " ")}`);
+        ' "$TW_REPORT"
+        exit 1
