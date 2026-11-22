@@ -220,7 +220,7 @@ jobs:
         run: '[ "$OUTCOME" = "failure" ] || { echo "a failing scenario must fail the step"; exit 1; }'
 
   pr-comment:
-    name: keeps exactly one PR comment, updated in place; the scenario never sees the token
+    name: keeps exactly one PR comment, updated in place; the token is not in the scenario's environment
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     needs: build-tokenwire
@@ -254,7 +254,7 @@ jobs:
           version: ${{ steps.tgz.outputs.path }}
           run: VARIANT=tool node test/fixture/scenario.mjs
           snapshot: test/fixture/tokenwire.snapshot.json
-      - name: the scenario ran without the token
+      - name: the token was not in the scenario's environment
         env:
           TOKEN: ${{ github.token }}
         run: |
@@ -276,8 +276,8 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/issues/comments/$oldest" --jq .body | grep -q "search_knowledge_base" \
             || { echo "the comment was not updated by the second run"; exit 1; }
 
-  scenario-has-no-token:
-    name: the scenario and the tokenwire package never see the token
+  scenario-env:
+    name: the token is not in the scenario's environment, and its leftover processes are killed
     runs-on: ubuntu-latest
     needs: build-tokenwire
     steps:
@@ -292,7 +292,11 @@ jobs:
       - uses: ./
         with:
           version: ${{ steps.tgz.outputs.path }}
-          run: env > "$RUNNER_TEMP/scenario.env" && node test/fixture/scenario.mjs
+          run: |
+            env > "$RUNNER_TEMP/scenario.env"
+            sleep 300 > /dev/null 2>&1 &
+            echo $! > "$RUNNER_TEMP/leftover.pid"
+            node test/fixture/scenario.mjs
           snapshot: test/fixture/tokenwire.snapshot.json
           github-token: ${{ github.token }}
           comment: false
@@ -302,7 +306,68 @@ jobs:
           [ -s "$RUNNER_TEMP/scenario.env" ] || { echo "the scenario did not run"; exit 1; }
           if grep -qF "$TOKEN" "$RUNNER_TEMP/scenario.env"; then echo "the token reached the scenario"; exit 1; fi
           if grep -qE '^(GH_TOKEN|GITHUB_TOKEN|TW_TOKEN)=' "$RUNNER_TEMP/scenario.env"; then echo "a token variable reached the scenario"; exit 1; fi
-          if grep -qE '^(GITHUB_ENV|GITHUB_PATH)=' "$RUNNER_TEMP/scenario.env"; then echo "the scenario can write env or path for later steps"; exit 1; fi
+          pid=$(cat "$RUNNER_TEMP/leftover.pid")
+          # A killed process can linger as a zombie until it is reaped; that is not running.
+          if [ -e "/proc/$pid" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$pid/status"; then
+            echo "the scenario's background process $pid is still running"; exit 1
+          fi
+
+  baseline-symlink:
+    name: a baseline replaced by a symlink is not a baseline
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - name: the change points the snapshot at a file it controls
+        run: |
+          echo '{}' > "$RUNNER_TEMP/elsewhere.json"
+          ln -sf "$RUNNER_TEMP/elsewhere.json" test/fixture/tokenwire.snapshot.json
+      - id: tw
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=tool node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          comment: false
+      - env:
+          OUTCOME: ${{ steps.tw.outcome }}
+          WRITTEN: ${{ steps.tw.outputs.baseline-written }}
+        run: |
+          [ "$OUTCOME" = "failure" ] || { echo "expected failure, got $OUTCOME"; exit 1; }
+          [ "$WRITTEN" != "true" ] || { echo "a new baseline was written"; exit 1; }
+          [ "$(cat "$RUNNER_TEMP/elsewhere.json")" = "{}" ] || { echo "a baseline was written through the symlink"; exit 1; }
+
+  full-clone-stays-full:
+    name: the base-branch fetch does not make a full clone shallow
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: node test/fixture/scenario.mjs
+          snapshot: new-baseline.json
+          comment: false
+      - run: |
+          shallow=$(git rev-parse --is-shallow-repository)
+          [ "$shallow" = "false" ] || { echo "the repository is shallow now"; exit 1; }
 
   baseline-deleted:
     name: deleting the baseline in a pull request fails instead of writing a new one
@@ -351,7 +416,21 @@ jobs:
         run: |
           got=$(jq -r -f lib/find-comment.jq test/fixture/comments.json | tr '\n' ' ')
           echo "selected: $got"
-          [ "$got" = "104 " ] || { echo "expected only comment 104 (the bot's own)"; exit 1; }
+          [ "$got" = "105 " ] || { echo "expected only comment 105 (github-actions[bot]'s own)"; exit 1; }
+      - name: with comment-author set to an app, only the app's comment
+        env:
+          TW_MARKER: "<!-- tokenwire-diff -->"
+          TW_AUTHOR: "my-app[bot]"
+        run: |
+          got=$(jq -r -f lib/find-comment.jq test/fixture/comments.json | tr '\n' ' ')
+          [ "$got" = "104 " ] || { echo "expected only comment 104, got $got"; exit 1; }
+      - name: identity unknown (GITHUB_TOKEN, app token), any bot's comment but never a person's
+        env:
+          TW_MARKER: "<!-- tokenwire-diff -->"
+          TW_AUTHOR: ""
+        run: |
+          got=$(jq -r -f lib/find-comment.jq test/fixture/comments.json | tr '\n' ' ')
+          [ "$got" = "104 105 " ] || { echo "expected 104 and 105, got $got"; exit 1; }
       - name: with a personal access token, that token's own comment is the one
         env:
           TW_MARKER: "<!-- tokenwire-diff -->"

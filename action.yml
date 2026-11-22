@@ -44,11 +44,21 @@ inputs:
     required: false
     default: ""
   comment:
-    description: "On pull requests, post the report as a comment and keep updating that one comment. Needs `pull-requests: write`."
+    description: >-
+      On pull requests, post the report as a comment and keep updating that one comment.
+      Needs `pull-requests: write`. Set false when the scenario runs untrusted code and post
+      the `markdown` output from a separate job instead (see the README).
     required: false
     default: "true"
+  comment-author:
+    description: >-
+      Login the comment is posted as, e.g. `my-app[bot]` for a GitHub App token. Only a
+      comment by this login is updated. Empty: the token's user if it can be read, otherwise
+      any bot.
+    required: false
+    default: ""
   github-token:
-    description: "Token for the PR comment."
+    description: "Token for the PR comment and for fetching the base branch."
     required: false
     default: ${{ github.token }}
   version:
@@ -85,6 +95,9 @@ outputs:
   report:
     description: "Path to the JSON report on the runner."
     value: ${{ steps.run.outputs.report }}
+  markdown:
+    description: "Path to the Markdown report on the runner: the PR comment's body. Empty when no diff was made."
+    value: ${{ steps.run.outputs.markdown }}
 
 runs:
   using: composite
@@ -94,15 +107,18 @@ runs:
     #    anything from the PR does, and is the only step besides the comment that gets the
     #    token (for the fetch, through git's environment, never argv).
     - id: guard
-      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         TW_SNAPSHOT: ${{ inputs.snapshot }}
-        TW_BASE: ${{ github.base_ref }}
+        TW_BASE: ${{ github.base_ref || github.event.merge_group.base_ref }}
         TW_TOKEN: ${{ inputs.github-token }}
       run: |
-        if [ -e "$TW_SNAPSHOT" ]; then
+        TW_BASE="${TW_BASE#refs/heads/}"
+        # Only a regular file counts as a baseline. A symlink or a directory is treated as
+        # missing, the same way the run step treats it.
+        if [ -f "$TW_SNAPSHOT" ] && [ ! -L "$TW_SNAPSHOT" ]; then
           exit 0
         fi
         if ! top=$(git rev-parse --show-toplevel 2>/dev/null); then
@@ -123,20 +139,28 @@ runs:
           export GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" GIT_CONFIG_VALUE_0=""
           export GIT_CONFIG_KEY_1="http.${GITHUB_SERVER_URL}/.extraheader" GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $basic"
         fi
+        # --depth only on a shallow checkout (the actions/checkout default): on a full clone
+        # it would make the repository shallow.
+        depth=()
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          depth=(--depth=1)
+        fi
         status=0
-        git -c core.hooksPath=/dev/null fetch --quiet --no-tags --no-recurse-submodules --depth=1 \
+        git -c core.hooksPath=/dev/null fetch --quiet --no-tags --no-recurse-submodules "${depth[@]}" \
           origin "+refs/heads/$TW_BASE:refs/remotes/origin/$TW_BASE" || status=$?
         if [ "$status" -ne 0 ]; then
           echo "::error::tokenwire: $TW_SNAPSHOT is missing, and the base branch $TW_BASE could not be fetched to check whether it has one. Commit the baseline, or make origin fetchable from this job."
           exit 2
         fi
         if git cat-file -e "refs/remotes/origin/$TW_BASE:$spec" 2>/dev/null; then
-          echo "::error file=$TW_SNAPSHOT::tokenwire: $TW_SNAPSHOT exists on $TW_BASE but not in this pull request. Without it every change would pass, so this fails. Restore it with 'git checkout origin/$TW_BASE -- $TW_SNAPSHOT', or regenerate it locally and commit it if the change is intended."
+          echo "::error file=$TW_SNAPSHOT::tokenwire: $TW_SNAPSHOT exists on $TW_BASE but is missing here (or is not a regular file). Without it every change would pass, so this fails. Restore it with 'git checkout origin/$TW_BASE -- $TW_SNAPSHOT', or regenerate it locally and commit it if the change is intended."
           exit 1
         fi
 
-    # 2. Record, compare, report. No token here: this step runs the scenario, which is
-    #    code from the pull request, and the tokenwire package downloaded by npx.
+    # 2. Record, compare, report. The token is not in this step's environment: it runs the
+    #    scenario, which is code from the pull request, and the tokenwire package from npm.
+    #    That keeps it out of their reach in the simple case only; code running in the
+    #    same job can still tamper with later steps (see the README, "Untrusted code").
     - id: run
       shell: bash
       working-directory: ${{ inputs.working-directory }}
@@ -171,22 +195,40 @@ runs:
         echo "report=$report" >> "$GITHUB_OUTPUT"
 
         # Record. --only budget with no budget runs no lint rules, so wrap's exit code is
-        # the scenario's own: a failing scenario fails the step. The scenario does not get
-        # the runner's env and path files, so it cannot plant variables for later steps.
+        # the scenario's own: a failing scenario fails the step.
         wrap=(wrap --session "$session" --only budget)
         if [ "$TW_OFFLINE" = "true" ]; then
           wrap+=(--offline)
           [ -n "$TW_REPLY" ] && wrap+=(--reply "$TW_REPLY")
         fi
         echo "::group::tokenwire · recording: $TW_RUN"
+        # Where util-linux setsid is available (Linux runners), the scenario gets its own
+        # process group, and whatever it leaves running is killed before the next step.
+        # Best effort: a process can leave the group on purpose.
+        scenario=(bash -c "$TW_RUN")
+        pgfile="${RUNNER_TEMP}/tokenwire.scenario.pgid"
+        rm -f "$pgfile"
+        if setsid --help 2>/dev/null | grep -q -- '--wait'; then
+          # shellcheck disable=SC2016 # $$ and $0/$1 belong to the inner bash
+          scenario=(setsid --wait bash -c 'printf %s "$$" > "$1"; exec bash -c "$0"' "$TW_RUN" "$pgfile")
+        fi
         status=0
-        tw "${wrap[@]}" -- env -u GITHUB_ENV -u GITHUB_PATH bash -c "$TW_RUN" || status=$?
+        tw "${wrap[@]}" -- "${scenario[@]}" || status=$?
+        if [ -s "$pgfile" ]; then
+          kill -KILL -- "-$(cat "$pgfile")" 2>/dev/null || true
+        fi
         echo "::endgroup::"
         if [ "$status" -ne 0 ]; then
           echo "::error::tokenwire: the scenario exited $status. See the log above."
           exit 2
         fi
 
+        # Only a regular file is a baseline. Anything else at that path is an error rather
+        # than a reason to write a new one through it.
+        if [ -L "$TW_SNAPSHOT" ] || { [ -e "$TW_SNAPSHOT" ] && [ ! -f "$TW_SNAPSHOT" ]; }; then
+          echo "::error file=$TW_SNAPSHOT::tokenwire: $TW_SNAPSHOT is not a regular file (a symlink or a directory). Commit the baseline as a plain file."
+          exit 2
+        fi
         # No baseline (and, on a pull request, none on the base branch either): write it
         # and stop here.
         if [ ! -f "$TW_SNAPSHOT" ]; then
@@ -250,8 +292,8 @@ runs:
         fi
         echo "failed=$failed" >> "$GITHUB_OUTPUT"
 
-    # 3. One comment per PR, updated in place. Only a comment this action's own identity
-    #    posted is ever edited, so a marker pasted into someone else's comment is ignored.
+    # 3. One comment per PR, updated in place. Only a comment by the identity the action
+    #    posts as is ever edited, so a marker pasted into someone else's comment is ignored.
     - id: comment
       if: inputs.comment == 'true' && github.event.pull_request.number && steps.run.outputs.markdown != ''
       shell: bash
@@ -261,21 +303,24 @@ runs:
         TW_REPO: ${{ github.repository }}
         TW_MD: ${{ steps.run.outputs.markdown }}
         TW_MARKER: "<!-- tokenwire-diff -->"
+        TW_AUTHOR: ${{ inputs.comment-author }}
       run: |
-        # A personal access token can say who it is; GITHUB_TOKEN cannot (403), and posts
-        # as github-actions[bot].
-        # On an error gh prints the response body to stdout, so only a zero exit counts.
-        if login=$(gh api user --jq .login 2>/dev/null) && [ -n "$login" ] && [ "$login" != "null" ]; then
-          TW_AUTHOR="$login"
-        else
-          TW_AUTHOR="github-actions[bot]"
+        # Who the comment is posted as: the comment-author input; else the token's user,
+        # which a personal access token can read; else (GITHUB_TOKEN, GitHub App tokens:
+        # GET /user is a 403) any bot. gh prints an error body to stdout, so only a zero
+        # exit counts.
+        if [ -z "$TW_AUTHOR" ]; then
+          if login=$(gh api user --jq .login 2>/dev/null) && [ -n "$login" ] && [ "$login" != "null" ]; then
+            TW_AUTHOR="$login"
+          fi
         fi
         export TW_AUTHOR
         filter=$(cat "$GITHUB_ACTION_PATH/lib/find-comment.jq")
-        existing=""
-        if ids=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate --jq "$filter" 2>/dev/null); then
-          existing=$(printf '%s\n' "$ids" | head -n1)
+        if ! ids=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate --jq "$filter" 2>/dev/null); then
+          echo "::warning::tokenwire could not list the PR's comments, so it did not post one (a new one could duplicate the existing). The report is in the job summary."
+          exit 0
         fi
+        existing=$(printf '%s\n' "$ids" | head -n1)
         case "$existing" in *[!0-9]*) existing="" ;; esac
         if [ -n "$existing" ]; then
           gh api -X PATCH "repos/$TW_REPO/issues/comments/$existing" -F "body=@$TW_MD" >/dev/null \

@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          persist-credentials: false # the scenario cannot read the job token from .git/config
+          persist-credentials: false # keeps the job token out of .git/config
       - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - run: npm ci
@@ -83,19 +83,124 @@ npx tokenwire@0.2.0 wrap --offline -- node test/agent-scenario.js
 npx tokenwire@0.2.0 snapshot
 ```
 
-Deleting the baseline does not get a PR through. On `pull_request` events, when the snapshot is missing, the action fetches the base branch first; if the file exists there, the step fails before the scenario runs. A repository that has never had a baseline still gets one written on the runner, with a notice to create and commit it locally.
+If a pull request deletes the baseline, the action does not quietly write a new one. On `pull_request`, `pull_request_target` and `merge_group` events, when the snapshot is missing (or is a symlink or a directory, which never counts as a baseline), the action fetches the base branch first; if the file exists there, the step fails before the scenario runs. A repository that has never had a baseline still gets one written on the runner, with a notice to create and commit it locally.
 
-## Pull requests from forks
+This catches a deleted or replaced file. It cannot stop a PR that also edits the workflow, for example to change the `snapshot:` input or drop the step, because the PR controls the workflow it runs with. Review workflow changes, and require this check on the base branch.
 
-On a `pull_request` event from a fork, GitHub gives the job a read-only token, whatever `permissions:` says. The action cannot post its comment there: the step warns, and the full report is still in the job summary, and the check still passes or fails.
+## Untrusted code in the scenario
 
-If you want comments on fork PRs, keep the workflow above as it is and add a second workflow on `workflow_run` that downloads the report (upload `${{ steps.<id>.outputs.report }}` with `actions/upload-artifact`) and posts it. That workflow has a write token but never runs code from the fork. Do not switch this workflow to `pull_request_target` with a checkout of the PR's code: that runs the fork's code with a write token and your secrets.
+The scenario is code from the pull request, and it runs on the same runner as the rest of the job. The action keeps the token out of the scenario's environment: only the base-branch fetch and the comment step get it, and on Linux the scenario's leftover processes are killed before the comment step. That is best effort, not isolation. Code that runs in a job can change what later steps in that job do: for example it can write to the runner's environment file so that the comment step runs something else, or keep a process running outside its process group. Treat anything in the same job as reachable from the scenario.
 
-## What sees the token
+What that means in practice:
 
-The token (`github-token`, by default the job's `GITHUB_TOKEN`) is passed only to the step that fetches the base branch and the step that posts the comment. The step that runs your scenario and the tokenwire package from npm does not have it, and the scenario runs with `GITHUB_ENV` and `GITHUB_PATH` unset. This narrows what code from a PR can reach; it is not a sandbox, since the scenario runs on the same runner as the rest of the job. `actions/checkout` stores the job token in `.git/config` unless you set `persist-credentials: false`, as the example does.
+- **PRs from forks** get a read-only `GITHUB_TOKEN`, whatever `permissions:` says. The scenario cannot do more with it than read, and the action cannot comment: the step warns, the report is in the job summary, and the check still passes or fails.
+- **PRs from branches of your repository** are written by people who can push anyway. The one-job setup above is fine for them.
+- **If you do not want PR code in the same job as a write token**, run the action with `comment: false` and post the comment from a second job that runs no PR code:
 
-The PR comment is updated in place. The action only edits a comment that starts with its marker **and** was posted by its own identity (`github-actions[bot]`, or the user a personal access token belongs to), so a marker pasted into someone else's comment is left alone.
+```yaml
+on: pull_request
+permissions:
+  contents: read
+
+jobs:
+  prompts:
+    runs-on: ubuntu-latest
+    outputs:
+      report: ${{ steps.tokenwire.outputs.markdown != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - run: npm ci
+      - id: tokenwire
+        uses: rajanaggarwal11/tokenwire-action@v1
+        with:
+          run: node test/agent-scenario.js
+          max-increase: 10%
+          comment: false
+      - if: ${{ !cancelled() && steps.tokenwire.outputs.markdown != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: tokenwire-report
+          path: ${{ steps.tokenwire.outputs.markdown }}
+
+  comment:
+    needs: prompts
+    # Fork PRs get a read-only token here too; see below for those.
+    if: ${{ !cancelled() && needs.prompts.outputs.report == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { name: tokenwire-report }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENTS: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        run: |
+          mine='.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- tokenwire-diff -->"))) | .id'
+          id=$(gh api "$COMMENTS" --paginate --jq "$mine" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@tokenwire.diff.md >/dev/null
+          else
+            gh api -X POST "$COMMENTS" -F body=@tokenwire.diff.md >/dev/null
+          fi
+```
+
+The `comment` job only reads a Markdown file the first job wrote, so the worst PR code can do there is choose the comment's text.
+
+**Comments on fork PRs** need a workflow that runs in the context of your repository: a second workflow on `workflow_run`. It runs after the one above (upload the PR number next to the report), never checks out or runs the fork's code, and checks that the PR number from the artifact matches the run's commit:
+
+```yaml
+# In the first workflow, before the upload step, and upload both files:
+#   - run: echo "$PR" > "$RUNNER_TEMP/pr-number"
+#     env: { PR: "${{ github.event.pull_request.number }}" }
+#   path: |
+#     ${{ steps.tokenwire.outputs.markdown }}
+#     ${{ runner.temp }}/pr-number
+name: tokenwire comment
+on:
+  workflow_run:
+    workflows: [prompts] # the `name:` of the first workflow
+    types: [completed]
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: tokenwire-report
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr=$(cat pr-number)
+          case "$pr" in ''|*[!0-9]*) echo "not a PR number"; exit 1 ;; esac
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)" = "$HEAD_SHA" ] \
+            || { echo "PR $pr is not at $HEAD_SHA"; exit 1; }
+          comments="repos/$GITHUB_REPOSITORY/issues/$pr/comments"
+          mine='.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- tokenwire-diff -->"))) | .id'
+          id=$(gh api "$comments" --paginate --jq "$mine" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@tokenwire.diff.md >/dev/null
+          else
+            gh api -X POST "$comments" -F body=@tokenwire.diff.md >/dev/null
+          fi
+```
+
+Do not switch to `pull_request_target` with a checkout of the PR's code: that runs the fork's code with a write token and your secrets.
+
+## Which comment is updated
+
+The action only edits a comment that starts with its marker **and** was posted by the identity it posts as: the `comment-author` input if you set it, otherwise the token's user if the token can say who it is (a personal access token), otherwise any bot (the default `GITHUB_TOKEN` and GitHub App tokens cannot read their own login). A marker pasted into a person's comment is left alone. With a GitHub App token, set `comment-author: <app-slug>[bot]` so only the app's own comment is updated. If the comments cannot be listed, the action warns and does not post, rather than risk a second comment.
 
 ## Inputs
 
@@ -109,8 +214,9 @@ The PR comment is updated in place. The action only edits a comment that starts 
 | `runs-per-day`        |                           | With `price`: production volume, for cost per day and month.                                         |
 | `offline`             | `true`                    | `false` calls the real provider; your scenario then needs a key and the run costs money.             |
 | `reply`               |                           | With offline: assistant text every request gets back, if your app needs some to proceed.             |
-| `comment`             | `true`                    | Keep one comment on the PR up to date. Needs `pull-requests: write`; without it the step only warns. |
-| `github-token`        | `github.token`            | Token for the comment and for fetching the base branch. Never given to the scenario.                 |
+| `comment`             | `true`                    | Keep one comment on the PR up to date. Needs `pull-requests: write`; without it the step only warns. `false` for the two-job setup. |
+| `comment-author`      |                           | Login the comment is posted as, e.g. `my-app[bot]`. Empty: the token's user if readable, else any bot. |
+| `github-token`        | `github.token`            | Token for the comment and for fetching the base branch. Not in the scenario's environment.           |
 | `version`             | `0.2.0`                   | tokenwire version: an exact version, a dist-tag such as `latest`, or a path to a packed tarball.     |
 | `working-directory`   | `.`                       | Where to run.                                                                                        |
 
@@ -129,7 +235,7 @@ Use the same version locally when you write the baseline.
 
 ## Outputs
 
-`input-tokens`, `base-input-tokens`, `delta-tokens`, `delta-pct`, `cache-break` (`true`/`false`), `baseline-written`, and `report` (path to the JSON report).
+`input-tokens`, `base-input-tokens`, `delta-tokens`, `delta-pct`, `cache-break` (`true`/`false`), `baseline-written`, `report` (path to the JSON report) and `markdown` (path to the Markdown report, the comment's body).
 
 ## Exit status
 

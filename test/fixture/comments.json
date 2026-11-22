@@ -1,6 +1,7 @@
 [
-  { "id": 101, "user": { "login": "someone-else" }, "body": "<!-- tokenwire-diff -->\nA human pasted the marker here." },
-  { "id": 102, "user": { "login": "github-actions[bot]" }, "body": "An unrelated bot comment." },
-  { "id": 103, "user": { "login": "github-actions[bot]" }, "body": null },
-  { "id": 104, "user": { "login": "github-actions[bot]" }, "body": "<!-- tokenwire-diff -->\ntokenwire diff  467 → 467 input tokens per run" }
+  { "id": 101, "user": { "login": "someone-else", "type": "User" }, "body": "<!-- tokenwire-diff -->\nA human pasted the marker here." },
+  { "id": 102, "user": { "login": "github-actions[bot]", "type": "Bot" }, "body": "An unrelated bot comment." },
+  { "id": 103, "user": { "login": "github-actions[bot]", "type": "Bot" }, "body": null },
+  { "id": 104, "user": { "login": "my-app[bot]", "type": "Bot" }, "body": "<!-- tokenwire-diff -->\ntokenwire diff  467 → 467 input tokens per run" },
+  { "id": 105, "user": { "login": "github-actions[bot]", "type": "Bot" }, "body": "<!-- tokenwire-diff -->\ntokenwire diff  467 → 512 input tokens per run" }
 ]
