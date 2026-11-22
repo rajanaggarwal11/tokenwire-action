@@ -4,7 +4,7 @@
 
 Please report it privately: on this repository, open **Security → Report a vulnerability**. Do not open a public issue.
 
-Include the workflow that shows the problem (or a minimal one), what you expected, and what happened. You will get a reply within a week.
+Include the workflow that shows the problem (or a minimal one), what you expected, and what happened.
 
 ## Scope
 
