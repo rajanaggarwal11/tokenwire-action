@@ -1,0 +1,230 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly, because users get tokenwire@latest: a regression in a new release of the
+  # package should show up here before a user hits it.
+  schedule:
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  build-tokenwire:
+    name: build tokenwire from source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: rajanaggarwal11/tokenwire
+          path: tokenwire
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: tokenwire/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: |
+          cd tokenwire
+          pnpm install --frozen-lockfile
+          pnpm build
+          mkdir -p "$RUNNER_TEMP/out"
+          pnpm pack --pack-destination "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokenwire-tgz
+          path: ${{ runner.temp }}/out/*.tgz
+
+  unchanged:
+    name: an unchanged scenario passes with a zero diff
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          max-increase: 10%
+          comment: false
+      - run: |
+          echo "base=${{ steps.tw.outputs.base-input-tokens }} head=${{ steps.tw.outputs.input-tokens }} delta=${{ steps.tw.outputs.delta-tokens }}"
+          [ "${{ steps.tw.outputs.delta-tokens }}" = "0" ] || { echo "expected no change"; exit 1; }
+          [ "${{ steps.tw.outputs.cache-break }}" = "false" ] || { echo "expected no cache break"; exit 1; }
+          [ "${{ steps.tw.outputs.input-tokens }}" -gt 100 ] || { echo "expected a real token count"; exit 1; }
+
+  grows-over-limit:
+    name: a new tool over max-increase fails, and says by how much
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=tool node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          max-increase: 10%
+          price: "3"
+          runs-per-day: "10000"
+          comment: false
+      - run: |
+          [ "${{ steps.tw.outcome }}" = "failure" ] || { echo "expected failure, got ${{ steps.tw.outcome }}"; exit 1; }
+          [ "${{ steps.tw.outputs.delta-tokens }}" -gt 0 ] || { echo "expected growth"; exit 1; }
+          [ "${{ steps.tw.outputs.cache-break }}" = "false" ] || { echo "a new tool is not a cache break within the run"; exit 1; }
+
+  grows-without-limit:
+    name: growth without max-increase reports but passes
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=tool node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          comment: false
+      - run: '[ "${{ steps.tw.outputs.delta-tokens }}" -gt 0 ] || { echo "expected growth"; exit 1; }'
+
+  cache-break:
+    name: a timestamp re-rendered per request fails as a cache break
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=clock node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          comment: false
+      - run: |
+          [ "${{ steps.tw.outcome }}" = "failure" ] || { echo "expected failure, got ${{ steps.tw.outcome }}"; exit 1; }
+          [ "${{ steps.tw.outputs.cache-break }}" = "true" ] || { echo "expected cache-break=true"; exit 1; }
+      - id: waived
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=clock node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+          fail-on-cache-break: false
+          comment: false
+      - run: '[ "${{ steps.waived.outputs.cache-break }}" = "true" ] || exit 1'
+
+  first-run:
+    name: with no baseline, writes one and passes
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: node test/fixture/scenario.mjs
+          snapshot: new-baseline.json
+          comment: false
+      - run: |
+          [ "${{ steps.tw.outputs.baseline-written }}" = "true" ] || exit 1
+          node -e 'const s = require("./new-baseline.json"); if (s.tokenwire !== 1 || s.turns.length !== 2) process.exit(1)'
+          if grep -q "INV-2041" new-baseline.json; then echo "conversation text leaked into the baseline"; exit 1; fi
+
+  scenario-fails:
+    name: a scenario that fails is a failed step
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - id: tw
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: node -e "process.exit(3)"
+          comment: false
+      - run: '[ "${{ steps.tw.outcome }}" = "failure" ] || { echo "a failing scenario must fail the step"; exit 1; }'
+
+  pr-comment:
+    name: keeps exactly one PR comment, updated in place
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    needs: build-tokenwire
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: actions/download-artifact@v4
+        with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
+      - id: tgz
+        run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+      - uses: ./
+        with:
+          version: ${{ steps.tgz.outputs.path }}
+          run: VARIANT=tool node test/fixture/scenario.mjs
+          snapshot: test/fixture/tokenwire.snapshot.json
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- tokenwire-diff -->"))] | length')
+          echo "tokenwire comments on this PR: $n"
+          [ "$n" = "1" ] || { echo "expected exactly one comment"; exit 1; }
+          body=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- tokenwire-diff -->")) | .body')
+          echo "$body" | grep -q "search_knowledge_base" || { echo "the comment was not updated by the second run"; exit 1; }

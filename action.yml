@@ -1,0 +1,217 @@
+name: "tokenwire"
+description: "Size-limit for prompts: what each PR adds to every LLM request — tokens by section, tools, prompt-cache breaks to the character, cost. Records offline: no API key, nothing sent."
+author: "Rajan Aggarwal"
+
+branding:
+  icon: "activity"
+  color: "orange"
+
+inputs:
+  run:
+    description: >-
+      The command that runs your scenario — anything that makes the requests your app
+      makes, e.g. `node test/agent-scenario.js` or `npm run llm-scenario`. Run with
+      `bash -c`, so quoting and && work.
+    required: true
+  snapshot:
+    description: >-
+      Path of the committed baseline. If it does not exist yet, the step writes it,
+      passes, and asks you to commit it.
+    required: false
+    default: "tokenwire.snapshot.json"
+  max-increase:
+    description: "Fail when input tokens per run grow by more than this: a percentage (`10%`) or a token count (`2k`). Empty: never fail on size."
+    required: false
+    default: ""
+  fail-on-cache-break:
+    description: "Fail when the change makes a request stop repeating the one before it, so the prompt cache misses."
+    required: false
+    default: "true"
+  price:
+    description: "USD per million input tokens, for a cost line in the report."
+    required: false
+    default: ""
+  runs-per-day:
+    description: "With `price`: how often the scenario runs in production, to show the change per day and month."
+    required: false
+    default: ""
+  offline:
+    description: "Answer the model locally instead of calling it: free, deterministic, no key. Set false to call the real provider (your scenario then needs an API key)."
+    required: false
+    default: "true"
+  reply:
+    description: "With offline: the assistant text every request gets back, if your app needs some to proceed."
+    required: false
+    default: ""
+  comment:
+    description: "On pull requests, post the report as a comment and keep updating that one comment. Needs `pull-requests: write`."
+    required: false
+    default: "true"
+  github-token:
+    description: "Token for the PR comment."
+    required: false
+    default: ${{ github.token }}
+  version:
+    description: "Version of tokenwire to run: an npm dist-tag or version, or the path of a packed tarball."
+    required: false
+    default: "latest"
+  working-directory:
+    description: "Directory to run in."
+    required: false
+    default: "."
+
+outputs:
+  input-tokens:
+    description: "Input tokens per run, this change."
+    value: ${{ steps.run.outputs.input-tokens }}
+  base-input-tokens:
+    description: "Input tokens per run in the baseline."
+    value: ${{ steps.run.outputs.base-input-tokens }}
+  delta-tokens:
+    description: "Change in input tokens per run."
+    value: ${{ steps.run.outputs.delta-tokens }}
+  delta-pct:
+    description: "Change in input tokens per run, in percent (empty if the baseline was empty)."
+    value: ${{ steps.run.outputs.delta-pct }}
+  cache-break:
+    description: "`true` when this change introduces a prompt-cache break."
+    value: ${{ steps.run.outputs.cache-break }}
+  baseline-written:
+    description: "`true` when there was no baseline and this run wrote one."
+    value: ${{ steps.run.outputs.baseline-written }}
+  report:
+    description: "Path to the JSON report on the runner."
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TW_RUN: ${{ inputs.run }}
+        TW_SNAPSHOT: ${{ inputs.snapshot }}
+        TW_MAX: ${{ inputs.max-increase }}
+        TW_CACHE: ${{ inputs.fail-on-cache-break }}
+        TW_PRICE: ${{ inputs.price }}
+        TW_RUNS: ${{ inputs.runs-per-day }}
+        TW_OFFLINE: ${{ inputs.offline }}
+        TW_REPLY: ${{ inputs.reply }}
+        TW_COMMENT: ${{ inputs.comment }}
+        TW_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        TW_EVENT: ${{ github.event_name }}
+        TW_PR: ${{ github.event.pull_request.number }}
+        TW_REPO: ${{ github.repository }}
+      run: |
+        # A composite `shell: bash` step runs as `bash -e -o pipefail`. Every command
+        # whose exit code matters captures it on the same line, which -e leaves alone.
+
+        if [ -z "${TW_RUN// }" ]; then
+          echo "::error::tokenwire: the 'run' input is empty."
+          exit 2
+        fi
+        case "$TW_VERSION" in
+          *.tgz|file:*|/*|./*) pkg="${TW_VERSION#file:}" ;;
+          *) pkg="tokenwire@${TW_VERSION}" ;;
+        esac
+        tw() { npx --yes --package "$pkg" tokenwire "$@"; }
+
+        session="${RUNNER_TEMP}/tokenwire.session.jsonl"
+        report="${RUNNER_TEMP}/tokenwire.diff.json"
+        md="${RUNNER_TEMP}/tokenwire.diff.md"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+
+        # 1. Record. --only budget with no budget runs no lint rules, so wrap's exit
+        #    code is the scenario's own: a failing scenario fails the step.
+        wrap=(wrap --session "$session" --only budget)
+        if [ "$TW_OFFLINE" = "true" ]; then
+          wrap+=(--offline)
+          [ -n "$TW_REPLY" ] && wrap+=(--reply "$TW_REPLY")
+        fi
+        echo "::group::tokenwire · recording: $TW_RUN"
+        status=0
+        tw "${wrap[@]}" -- bash -c "$TW_RUN" || status=$?
+        echo "::endgroup::"
+        if [ "$status" -ne 0 ]; then
+          echo "::error::tokenwire: the scenario exited $status. See the log above."
+          exit 2
+        fi
+
+        # 2. No baseline yet: write it and stop here.
+        if [ ! -f "$TW_SNAPSHOT" ]; then
+          status=0
+          tw snapshot "$session" -o "$TW_SNAPSHOT" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::tokenwire: could not write the baseline. Did the scenario make any chat requests?"
+            exit 2
+          fi
+          echo "baseline-written=true" >> "$GITHUB_OUTPUT"
+          echo "::notice file=$TW_SNAPSHOT::tokenwire wrote the baseline $TW_SNAPSHOT. Commit it; later runs diff against it."
+          {
+            echo "## tokenwire"
+            echo
+            echo "No baseline yet, so this run wrote \`$TW_SNAPSHOT\`. Commit it: from the next run on, every change is compared against it."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        echo "baseline-written=false" >> "$GITHUB_OUTPUT"
+
+        # 3. Diff.
+        args=(diff "$TW_SNAPSHOT" "$session")
+        [ -n "$TW_MAX" ] && args+=(--max-increase "$TW_MAX")
+        [ -n "$TW_PRICE" ] && args+=(--price "$TW_PRICE")
+        [ -n "$TW_PRICE" ] && [ -n "$TW_RUNS" ] && args+=(--runs-per-day "$TW_RUNS")
+        status=0
+        tw "${args[@]}" --format json > "$report" || status=$?
+        if [ "$status" -eq 2 ] || [ ! -s "$report" ]; then
+          echo "::error::tokenwire could not compare against $TW_SNAPSHOT."
+          tw "${args[@]}" || true
+          exit 2
+        fi
+        tw "${args[@]}" --format markdown > "$md" || true
+        tw "${args[@]}" || true
+        cat "$md" >> "$GITHUB_STEP_SUMMARY"
+
+        node -e '
+          const fs = require("fs");
+          const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const pct = d.delta.pct === null ? "" : d.delta.pct.toFixed(1);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            `input-tokens=${d.head.inputTokens}\nbase-input-tokens=${d.base.inputTokens}\n` +
+            `delta-tokens=${d.delta.tokens}\ndelta-pct=${pct}\ncache-break=${d.cache.introduced.length > 0}\n`);
+        ' "$report"
+
+        # 4. One comment per PR, updated in place.
+        if [ "$TW_COMMENT" = "true" ] && [ -n "$TW_PR" ]; then
+          marker="<!-- tokenwire-diff -->"
+          existing=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null | head -n1 || true)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$TW_REPO/issues/comments/$existing" -F "body=@$md" >/dev/null \
+              || echo "::warning::tokenwire could not update the PR comment (does the job have pull-requests: write?)"
+          else
+            gh api -X POST "repos/$TW_REPO/issues/$TW_PR/comments" -F "body=@$md" >/dev/null \
+              || echo "::warning::tokenwire could not comment on the PR (does the job have pull-requests: write?)"
+          fi
+        fi
+
+        # 5. Verdict. The CLI fails on a new cache break and on --max-increase; a
+        #    cache break alone can be waved through with fail-on-cache-break: false.
+        if [ "$status" -eq 1 ]; then
+          only_cache=$(node -e '
+            const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            console.log(d.failures.every((f) => f.startsWith("this change breaks prompt caching")));
+          ' "$report")
+          if [ "$TW_CACHE" != "true" ] && [ "$only_cache" = "true" ]; then
+            echo "::warning::tokenwire: this change breaks prompt caching (fail-on-cache-break is off)."
+            exit 0
+          fi
+          node -e '
+            const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            for (const f of d.failures) console.log(`::error::tokenwire: ${f}`);
+          ' "$report"
+          exit 1
+        fi
+        exit 0

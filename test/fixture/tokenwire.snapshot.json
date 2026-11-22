@@ -1,0 +1,84 @@
+{
+  "tokenwire": 1,
+  "version": "0.1.1",
+  "offline": true,
+  "turns": [
+    {
+      "n": 1,
+      "kind": "anthropic-messages",
+      "model": "claude-sonnet-5",
+      "totalTokens": 134,
+      "exact": false,
+      "sections": [
+        {
+          "kind": "system",
+          "tokens": 32,
+          "hash": "bef3f0784317b8984eac8e2f0c6edfa355a7fe4c2878a8cca63486206964dd8c",
+          "text": "You are the support assistant for Acme Billing. Answer questions about invoices, refunds and plans.\nBe concise. Never promise a refund; open a ticket instead."
+        },
+        {
+          "kind": "tool-def",
+          "name": "get_invoice",
+          "tokens": 42,
+          "hash": "6b0510772471d49ad2cddf3be6534907079485928c290e80fb621dc7f2b37e4f",
+          "text": "{\"name\":\"get_invoice\",\"description\":\"Fetch an invoice by its number, with line items and status.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"number\":{\"type\":\"string\"}},\"required\":[\"number\"]}}"
+        },
+        {
+          "kind": "tool-def",
+          "name": "open_ticket",
+          "tokens": 48,
+          "hash": "7906079f90c45b065e40ed6cdf818c08b059ee9d5f7dc14f4fb3fe7e12063178",
+          "text": "{\"name\":\"open_ticket\",\"description\":\"Open a support ticket for a human to review.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"subject\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"subject\",\"body\"]}}"
+        },
+        {
+          "kind": "user",
+          "tokens": 12
+        }
+      ]
+    },
+    {
+      "n": 2,
+      "kind": "anthropic-messages",
+      "model": "claude-sonnet-5",
+      "totalTokens": 161,
+      "exact": false,
+      "sections": [
+        {
+          "kind": "system",
+          "tokens": 32,
+          "hash": "bef3f0784317b8984eac8e2f0c6edfa355a7fe4c2878a8cca63486206964dd8c",
+          "text": "You are the support assistant for Acme Billing. Answer questions about invoices, refunds and plans.\nBe concise. Never promise a refund; open a ticket instead."
+        },
+        {
+          "kind": "tool-def",
+          "name": "get_invoice",
+          "tokens": 42,
+          "hash": "6b0510772471d49ad2cddf3be6534907079485928c290e80fb621dc7f2b37e4f",
+          "text": "{\"name\":\"get_invoice\",\"description\":\"Fetch an invoice by its number, with line items and status.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"number\":{\"type\":\"string\"}},\"required\":[\"number\"]}}"
+        },
+        {
+          "kind": "tool-def",
+          "name": "open_ticket",
+          "tokens": 48,
+          "hash": "7906079f90c45b065e40ed6cdf818c08b059ee9d5f7dc14f4fb3fe7e12063178",
+          "text": "{\"name\":\"open_ticket\",\"description\":\"Open a support ticket for a human to review.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"subject\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"subject\",\"body\"]}}"
+        },
+        {
+          "kind": "user",
+          "tokens": 12
+        },
+        {
+          "kind": "assistant",
+          "name": "get_invoice",
+          "tokens": 15
+        },
+        {
+          "kind": "tool-result",
+          "name": "get_invoice",
+          "tokens": 12
+        }
+      ]
+    }
+  ],
+  "cacheBreaks": []
+}
