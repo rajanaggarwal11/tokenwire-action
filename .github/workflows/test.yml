@@ -22,7 +22,7 @@ jobs:
         with:
           repository: rajanaggarwal11/tokenwire
           path: tokenwire
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: tokenwire/package.json
       - uses: actions/setup-node@v7
