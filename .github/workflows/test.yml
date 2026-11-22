@@ -236,6 +236,14 @@ jobs:
         with: { name: tokenwire-tgz, path: "${{ runner.temp }}/tokenwire" }
       - id: tgz
         run: echo "path=$(ls "$RUNNER_TEMP"/tokenwire/*.tgz)" >> "$GITHUB_OUTPUT"
+      - name: count the action's comments before
+        id: before
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENTS: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        run: |
+          mine='.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- tokenwire-diff -->"))) | .id'
+          echo "n=$(gh api "$COMMENTS" --paginate --jq "$mine" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
       - uses: ./
         with:
           version: ${{ steps.tgz.outputs.path }}
@@ -253,16 +261,19 @@ jobs:
           [ -s "$RUNNER_TEMP/scenario.env" ] || { echo "the scenario did not run"; exit 1; }
           if grep -qF "$TOKEN" "$RUNNER_TEMP/scenario.env"; then echo "the token reached the scenario"; exit 1; fi
           if grep -qE '^(GH_TOKEN|GITHUB_TOKEN|TW_TOKEN)=' "$RUNNER_TEMP/scenario.env"; then echo "a token variable reached the scenario"; exit 1; fi
-      - name: exactly one comment by the action, updated by the second run
+      - name: no new comment once one exists, and the oldest is updated by the second run
         env:
           GH_TOKEN: ${{ github.token }}
           COMMENTS: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+          BEFORE: ${{ steps.before.outputs.n }}
         run: |
           mine='.[] | select(.user.login == "github-actions[bot]" and ((.body // "") | startswith("<!-- tokenwire-diff -->")))'
           n=$(gh api "$COMMENTS" --paginate --jq "$mine | .id" | wc -l | tr -d ' ')
-          echo "tokenwire comments on this PR: $n"
-          [ "$n" = "1" ] || { echo "expected exactly one comment"; exit 1; }
-          gh api "$COMMENTS" --paginate --jq "$mine | .body" | grep -q "search_knowledge_base" \
+          want=$(( BEFORE > 1 ? BEFORE : 1 ))
+          echo "tokenwire comments on this PR: $BEFORE before, $n after"
+          [ "$n" = "$want" ] || { echo "expected $want comment(s)"; exit 1; }
+          oldest=$(gh api "$COMMENTS" --paginate --jq "$mine | .id" | sort -n | head -n1)
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/$oldest" --jq .body | grep -q "search_knowledge_base" \
             || { echo "the comment was not updated by the second run"; exit 1; }
 
   scenario-has-no-token:

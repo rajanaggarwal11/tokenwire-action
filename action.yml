@@ -264,10 +264,19 @@ runs:
       run: |
         # A personal access token can say who it is; GITHUB_TOKEN cannot (403), and posts
         # as github-actions[bot].
-        TW_AUTHOR=$(gh api user --jq .login 2>/dev/null || true)
-        export TW_AUTHOR="${TW_AUTHOR:-github-actions[bot]}"
+        # On an error gh prints the response body to stdout, so only a zero exit counts.
+        if login=$(gh api user --jq .login 2>/dev/null) && [ -n "$login" ] && [ "$login" != "null" ]; then
+          TW_AUTHOR="$login"
+        else
+          TW_AUTHOR="github-actions[bot]"
+        fi
+        export TW_AUTHOR
         filter=$(cat "$GITHUB_ACTION_PATH/lib/find-comment.jq")
-        existing=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate --jq "$filter" 2>/dev/null | head -n1 || true)
+        existing=""
+        if ids=$(gh api "repos/$TW_REPO/issues/$TW_PR/comments" --paginate --jq "$filter" 2>/dev/null); then
+          existing=$(printf '%s\n' "$ids" | head -n1)
+        fi
+        case "$existing" in *[!0-9]*) existing="" ;; esac
         if [ -n "$existing" ]; then
           gh api -X PATCH "repos/$TW_REPO/issues/comments/$existing" -F "body=@$TW_MD" >/dev/null \
             || echo "::warning::tokenwire could not update the PR comment (does the job have pull-requests: write?)"
